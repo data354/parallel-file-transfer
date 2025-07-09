@@ -1,14 +1,20 @@
 # sftp_to_minio/main_dag.py
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.datasets  import Dataset
+# Correction de l'import Dataset pour les versions récentes d'Airflow
+try:
+    from airflow.datasets import Dataset
+except ImportError:
+    # Fallback pour les versions plus anciennes
+    from airflow.models.dataset import Dataset
+    
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import socket
 import os
 from datetime import datetime
 import paramiko
-from dag_config import default_args, LOCAL_DIR, LOG_DIR, SSH_CONN_ID, MINIO_CONN_ID, MAX_WORKERS, BUCKET_NAME, BUCKET_PATH
+from config import default_args, LOCAL_DIR, LOG_DIR, SSH_CONN_ID, MINIO_CONN_ID, MAX_WORKERS, BUCKET_NAME, BUCKET_PATH
 from database_manager import DatabaseManager
 from connection_handler import transfer_file_with_persistent_connections
 from airflow.hooks.base import BaseHook
@@ -238,6 +244,13 @@ def run_transfer():
             finally:
                 db_manager.cleanup()
 
+def hello_task():
+    """Tâche qui affiche un message hello quand le dataset est mis à jour"""
+    logging.info("Hello! Le dataset bronze a été mis à jour avec de nouveaux fichiers!")
+    logging.info(f"Dataset URI: {BRONZE_DATASET.uri}")
+    print("Hello! Le dataset bronze a été mis à jour avec de nouveaux fichiers!")
+    print(f"Dataset URI: {BRONZE_DATASET.uri}")
+
 dag = DAG(
     'parallel_sftp_to_minio_v23_multiworker__m',
     default_args=default_args,
@@ -252,4 +265,20 @@ transfer_task = PythonOperator(
     python_callable=run_transfer,
     outlets=[BRONZE_DATASET],
     dag=dag
+)
+
+# DAG séparé qui se déclenche quand le dataset est mis à jour
+hello_dag = DAG(
+    'hello_on_dataset_update',
+    default_args=default_args,
+    schedule=[BRONZE_DATASET],  # Se déclenche quand le dataset est mis à jour
+    start_date=datetime(2025, 6, 24),
+    max_active_runs=1,
+    catchup=False
+)
+
+hello_task_operator = PythonOperator(
+    task_id='hello_task',
+    python_callable=hello_task,
+    dag=hello_dag
 )
