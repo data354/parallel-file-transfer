@@ -1,9 +1,10 @@
-# database_manager.py
+# sftp_to_minio/database_manager.py
 import logging
 import threading
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from airflow.hooks.base import BaseHook
+from datetime import datetime, timedelta
 from dag_config import DB_CONN_ID
 
 class DatabaseManager:
@@ -22,14 +23,11 @@ class DatabaseManager:
             return
             
         with self.lock:
-            if self.is_initialized:  # Double-check
+            if self.is_initialized:
                 return
                 
             try:
-                # Récupération de la connexion Airflow
                 db_conn = BaseHook.get_connection(DB_CONN_ID)
-                
-                # Création de la connexion PostgreSQL directe
                 self.connection = psycopg2.connect(
                     host=db_conn.host,
                     port=db_conn.port or 5432,
@@ -39,7 +37,6 @@ class DatabaseManager:
                 )
                 self.connection.autocommit = True
                 self.cursor = self.connection.cursor(cursor_factory=RealDictCursor)
-                
                 self.is_initialized = True
                 logging.info(f"[Worker {self.worker_id}] Connexion PostgreSQL initialisée")
                 
@@ -53,7 +50,6 @@ class DatabaseManager:
         self.initialize_connection()
         
         try:
-            # Création de la table si elle n'existe pas
             create_table_sql = """
             CREATE TABLE IF NOT EXISTS file_transfer_log (
                 id SERIAL PRIMARY KEY,
@@ -84,31 +80,66 @@ class DatabaseManager:
             raise
     
     def claim_file_for_processing(self, filename):
-        """
-        Tente de réserver un fichier pour le traitement.
-        Retourne True si le fichier a été réservé avec succès, False sinon.
-        """
+        """Tente de réserver un fichier pour le traitement avec gestion des conflits améliorée"""
         self.initialize_connection()
         
         try:
-            # Tentative d'insertion atomique
-            insert_sql = """
-            INSERT INTO file_transfer_log (filename, worker_id, status)
-            VALUES (%s, %s, 'IN_PROGRESS')
-            ON CONFLICT (filename) DO NOTHING
-            RETURNING id;
+            check_completed_sql = """
+            SELECT 1 FROM file_transfer_log 
+            WHERE filename = %s AND status = 'COMPLETED'
+            LIMIT 1
             """
-            
-            self.cursor.execute(insert_sql, [filename, self.worker_id])
-            result = self.cursor.fetchone()
-            
-            if result:
-                logging.info(f"Fichier {filename} réservé pour le worker {self.worker_id}")
-                return True
-            else:
-                logging.info(f"Fichier {filename} déjà en cours de traitement par un autre worker")
+            self.cursor.execute(check_completed_sql, [filename])
+            if self.cursor.fetchone():
+                logging.info(f"Fichier {filename} déjà complété - Ignoré")
                 return False
-                
+            
+            check_in_progress_sql = """
+            SELECT worker_id, transfer_start_time 
+            FROM file_transfer_log 
+            WHERE filename = %s AND status = 'IN_PROGRESS'
+            ORDER BY id DESC 
+            LIMIT 1
+            """
+            self.cursor.execute(check_in_progress_sql, [filename])
+            existing = self.cursor.fetchone()
+            
+            if existing:
+                if existing['transfer_start_time'] < datetime.now() - timedelta(minutes=4):
+                    logging.warning(
+                        f"Fichier {filename} en statut IN_PROGRESS depuis plus de 2 minutes "
+                        f"(worker: {existing['worker_id']}) - Reprise du traitement"
+                    )
+                    
+                    update_sql = """
+                    UPDATE file_transfer_log 
+                    SET status = 'FAILED', 
+                        error_message = 'Processing timeout',
+                        transfer_end_time = CURRENT_TIMESTAMP
+                    WHERE filename = %s AND status = 'IN_PROGRESS'
+                    """
+                    self.cursor.execute(update_sql, [filename])
+                    return True
+                else:
+                    logging.info(
+                        f"Fichier {filename} déjà en cours de traitement par "
+                        f"worker {existing['worker_id']} - Ignoré"
+                    )
+                    return False
+            
+            insert_sql = """
+            INSERT INTO file_transfer_log (
+                filename, 
+                worker_id, 
+                status,
+                transfer_start_time
+            )
+            VALUES (%s, %s, 'IN_PROGRESS', CURRENT_TIMESTAMP)
+            """
+            self.cursor.execute(insert_sql, [filename, self.worker_id])
+            logging.info(f"Fichier {filename} réservé pour traitement par worker {self.worker_id}")
+            return True
+            
         except Exception as e:
             logging.error(f"Erreur lors de la réservation du fichier {filename}: {str(e)}")
             return False
@@ -173,7 +204,6 @@ class DatabaseManager:
             SELECT filename FROM file_transfer_log 
             WHERE status = 'COMPLETED'
             """
-            
             self.cursor.execute(query)
             result = self.cursor.fetchall()
             return set(row['filename'] for row in result)
@@ -181,24 +211,6 @@ class DatabaseManager:
         except Exception as e:
             logging.error(f"Erreur lors de la récupération des fichiers traités: {str(e)}")
             return set()
-    
-    def cleanup_stale_locks(self, max_age_minutes=5):
-        """Nettoie les verrous obsolètes (fichiers en IN_PROGRESS depuis trop longtemps)"""
-        self.initialize_connection()
-        
-        try:
-            cleanup_sql = """
-            DELETE FROM file_transfer_log 
-            WHERE status = 'IN_PROGRESS' 
-            AND worker_id != %s
-            AND transfer_start_time < NOW() - INTERVAL '%s minutes'
-            """
-            
-            self.cursor.execute(cleanup_sql, [self.worker_id, max_age_minutes])
-            logging.info(f"Nettoyage des verrous obsolètes effectué par {self.worker_id}")
-            
-        except Exception as e:
-            logging.error(f"Erreur lors du nettoyage des verrous: {str(e)}")
     
     def get_active_workers_info(self):
         """Récupère les informations sur les workers actifs"""
@@ -220,6 +232,81 @@ class DatabaseManager:
             logging.error(f"Erreur lors du diagnostic des workers: {str(e)}")
             return []
     
+    def get_failed_files_for_retry(self, max_retries=3):
+        """Récupère les fichiers en échec qui peuvent être retentés"""
+        self.initialize_connection()
+        
+        try:
+            query = """
+            SELECT filename, COUNT(*) as retry_count 
+            FROM file_transfer_log 
+            WHERE status = 'FAILED' 
+            GROUP BY filename 
+            HAVING COUNT(*) < %s
+            """
+            self.cursor.execute(query, [max_retries])
+            result = self.cursor.fetchall()
+            return set(row['filename'] for row in result)
+            
+        except Exception as e:
+            logging.error(f"Erreur lors de la récupération des fichiers à retenter: {str(e)}")
+            return set()
+    
+    def cleanup_stale_locks(self, max_age_minutes=3):
+        """Nettoie les verrous obsolètes en les marquant comme FAILED"""
+        self.initialize_connection()
+        
+        try:
+            select_sql = """
+            SELECT filename, worker_id FROM file_transfer_log 
+            WHERE status = 'IN_PROGRESS' 
+            AND transfer_start_time < NOW() - INTERVAL '%s minutes'
+            """
+            self.cursor.execute(select_sql, [max_age_minutes])
+            stale_files = self.cursor.fetchall()
+            
+            if stale_files:
+                logging.warning(f"Nettoyage de {len(stale_files)} fichiers en attente trop longtemps:")
+                for file_info in stale_files:
+                    logging.warning(f"  - {file_info['filename']} (worker: {file_info['worker_id']})")
+            
+            cleanup_sql = """
+            UPDATE file_transfer_log 
+            SET status = 'FAILED', 
+                error_message = 'Timeout - Process interrupted or took too long',
+                transfer_end_time = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'IN_PROGRESS' 
+            AND transfer_start_time < NOW() - INTERVAL '%s minutes'
+            """
+            self.cursor.execute(cleanup_sql, [max_age_minutes])
+            logging.info(f"Nettoyage des verrous obsolètes effectué par {self.worker_id}")
+            
+        except Exception as e:
+            logging.error(f"Erreur lors du nettoyage des verrous: {str(e)}")
+    
+    def get_retry_statistics(self):
+        """Obtient les statistiques de retry pour le monitoring"""
+        self.initialize_connection()
+        
+        try:
+            stats_query = """
+            SELECT 
+                COUNT(DISTINCT filename) as unique_files,
+                COUNT(*) as total_attempts,
+                COUNT(CASE WHEN status = 'COMPLETED' THEN 1 END) as successful_attempts,
+                COUNT(CASE WHEN status = 'FAILED' THEN 1 END) as failed_attempts,
+                COUNT(CASE WHEN status = 'IN_PROGRESS' THEN 1 END) as in_progress_attempts
+            FROM file_transfer_log
+            WHERE created_at > NOW() - INTERVAL '24 hours'
+            """
+            self.cursor.execute(stats_query)
+            return self.cursor.fetchone()
+            
+        except Exception as e:
+            logging.error(f"Erreur lors de la récupération des statistiques: {str(e)}")
+            return None
+    
     def cleanup(self):
         """Ferme proprement la connexion PostgreSQL"""
         try:
@@ -235,5 +322,4 @@ class DatabaseManager:
             logging.error(f"[Worker {self.worker_id}] Erreur lors de la fermeture PostgreSQL: {str(e)}")
     
     def __del__(self):
-        """Destructeur pour s'assurer que la connexion est fermée"""
         self.cleanup()
